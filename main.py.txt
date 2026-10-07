@@ -1,0 +1,432 @@
+main.py
+# =============================================================================
+#  WARNING: RISK ONLY CASINO MONEY WITH THIS STRATEGY
+#  PLEASE WAIT FOR MINIMUM 3 MONTHS OF OOS PERFORMANCE
+#  Multi-Sleeve Momentum Rotation (Gold / Growth-Tech / Financials)
+# =============================================================================
+
+#  Gold-miner gate (GDXU/GDXD, RSI(10)) wraps everything. Inside that, a
+#  QQQ 90d-vs-70d cumulative-return split sends the book down one of two
+#  paths:
+#    Path A (QQQ 90d return > 70d return): a SPY-vs-200SMA regime gate into
+#      either (a) RSI(10) overbought cascade across
+#      SPY/IOO/TQQQ/VTV/XLF -> UVXY/BIL/BTAL, with a bull-trend branch that
+#      picks the single most-volatile-lately of 11 leveraged single-stock
+#      ETFs (AAPX/NVDL/BITX/TSLR/FBL/GGLL/AMZU/RGTI/PLTR/BABA/CONL) if its
+#      own underlying stock has positive 10d return-momentum, or (b) a
+#      TQQQ/SPY RSI<30/31 dip-buy, or a TQQQ-SMA20 momentum-vs-bear
+#      hedge branch (TECS/SOXS/SQQQ) with its own top-1-momentum leveraged-
+#      stock-ETF picker.
+#    Path B (QQQ 90d return <= 70d return): TLT-vs-QQQ momentum gate into
+#      GDXD, or a FAS (3x financials)-trend-vs-SMA50/200 gate choosing
+#      between (a) a top-3-by-20d-momentum basket across 12 financial/
+#      fintech names (V/SOFI/MA/BX/SCHW/KKR/BN/WELL/VTR/BAM/HOOD/IBKR) plus
+#      the same leveraged-stock-ETF basket as a 13th candidate, (b) a top-3-
+#      by-lowest-RSI(10) contrarian dip-buy among those 12 names, or (c) a
+#      FAS-vs-SMA100/RSI(10) gate into TMF/FAZ/leveraged-stock-basket
+#      (top-1 by 15d momentum) or an AGQ-vs-FAS RSI(10) switcher.
+# 
+#  -------------------------------------------------------------------------
+#  Decision computed once daily right after the session close (indicators
+#  finalize then); orders are MarketOnOpenOrder, filled at the NEXT
+#  session's open. No look-ahead.
+#
+# =============================================================================
+
+from AlgorithmImports import *
+from tree_data import TREE_JSON
+import json
+import numpy as np
+
+
+class MultiSleeveMomentumRotation(QCAlgorithm):
+
+    PRICE_WINDOW_SIZE = 210  # covers the largest lookback used (200) + buffer
+    LEVERAGE = 1.0           # target 100% of NAV in positions (margin)
+    CASH_BUFFER_PCT = 0.04   # always leave this fraction of NAV uninvested
+
+    # Simple flat-% intraday stop loss, checked every few minutes during
+    # market hours (requires Minute-resolution price data -- indicators
+    # below stay Resolution.DAILY, so the sleeve logic itself is unaffected).
+    # Basis = that day's open. Backtested at 15% as the best of {5,10,15,20}%
+    # tried on this strategy -- Pareto-beat the no-stop baseline on CAGR,
+    # drawdown, Sharpe, and Sortino all at once.
+    ENABLE_INTRADAY_SL = True
+    SL_PCT = 0.15
+    INTRADAY_CHECK_MINUTES = 5
+
+    def initialize(self) -> None: 
+        self.set_start_date(2021, 1, 1)
+        self.set_cash(10_000)
+        self.set_brokerage_model(
+            BrokerageName.INTERACTIVE_BROKERS_BROKERAGE,
+            AccountType.MARGIN,
+        )
+        self.set_benchmark("SPY")
+        self.settings.minimum_order_margin_portfolio_percentage = 0.0
+
+        self.tree = json.loads(TREE_JSON)
+
+        # -- Discover every ticker referenced (as a tradable asset or as an
+        #    indicator input) and every (ticker, RSI window) pair needed.
+        all_tickers = set()
+        self._collect_tickers(self.tree, all_tickers)
+
+        rsi_pairs = set()
+        self._collect_rsi_pairs(self.tree, rsi_pairs)
+
+        # -- Subscribe & build per-ticker daily price history + RSI indicators
+        self._syms = {}
+        self._price_window = {}
+        for t in sorted(all_tickers):
+            try:
+                sym = self.add_equity(t, Resolution.MINUTE).symbol
+            except Exception as e:
+                self.log(f"WARNING: could not subscribe {t}: {e}")
+                continue
+            self._syms[t] = sym
+            self._price_window[t] = RollingWindow[float](self.PRICE_WINDOW_SIZE)
+
+        self._rsi = {}
+        for ticker, window in rsi_pairs:
+            if ticker not in self._syms:
+                continue
+            self._rsi[(ticker, window)] = self.rsi(
+                self._syms[ticker], window, MovingAverageType.WILDERS, Resolution.DAILY
+            )
+
+        self.set_warm_up(self.PRICE_WINDOW_SIZE + 5, Resolution.DAILY)
+
+        # -- Seed price windows from history so day-0 evaluation has data
+        for t, sym in self._syms.items():
+            hist = self.history(sym, self.PRICE_WINDOW_SIZE + 5, Resolution.DAILY)
+            if not hist.empty:
+                closes = hist["close"].values
+                for c in closes[::-1]:  # oldest first push, so window[0] ends most recent
+                    if c > 0:
+                        self._price_window[t].add(float(c))
+
+        self._trade_count = 0
+        self._day_open = {}  # Symbol -> today's open, for the intraday SL
+
+        # -- Feed daily closes into the rolling windows right after each
+        #    session close, then compute the rebalance target and place
+        #    MarketOnOpenOrders for the next session's open.
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.after_market_close("SPY", 0),
+            self._update_price_windows,
+        )
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.after_market_close("SPY", 1),
+            self._rebalance,
+        )
+
+        # -- Snapshot today's open for every held name, then poll every few
+        #    minutes during market hours for the intraday stop loss.
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.after_market_open("SPY", 0),
+            self._snapshot_day_open,
+        )
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.every(timedelta(minutes=self.INTRADAY_CHECK_MINUTES)),
+            self._check_intraday_sl,
+        )
+
+    # ── Tree-requirement discovery ──────────────────────────────────
+
+    def _collect_tickers(self, node, out: set) -> None:
+        if node.get("t") == "node_asset":
+            out.add(node["tk"])
+        for expr_key in ("cond", "sf"):
+            if expr_key in node:
+                self._scan_expr_tickers(node[expr_key], out)
+        for key in ("c", "th", "el"):
+            for ch in node.get(key, []):
+                self._collect_tickers(ch, out)
+
+    def _scan_expr_tickers(self, expr, out: set) -> None:
+        if isinstance(expr, list):
+            for item in expr:
+                self._scan_expr_tickers(item, out)
+        elif isinstance(expr, str) and expr.startswith("EQUITIES::"):
+            out.add(expr.split("::")[1].split("//")[0])
+
+    def _collect_rsi_pairs(self, node, out: set) -> None:
+        for expr_key in ("cond",):
+            if expr_key in node:
+                self._scan_expr_rsi(node[expr_key], None, out)
+        if node.get("t") == "node_filter":
+            rsi_window = self._rsi_window_in_expr(node["sf"])
+            if rsi_window is not None:
+                for ch in node["c"]:
+                    rep = self._representative_ticker(ch)
+                    if rep:
+                        out.add((rep, rsi_window))
+        for key in ("c", "th", "el"):
+            for ch in node.get(key, []):
+                self._collect_rsi_pairs(ch, out)
+
+    def _scan_expr_rsi(self, expr, ref_ticker, out: set) -> None:
+        if not isinstance(expr, list):
+            return
+        if expr[0] == "fn_relative_strength_index":
+            tk = self._ticker_of(expr[1], ref_ticker)
+            if tk:
+                out.add((tk, expr[2]))
+        for item in expr:
+            self._scan_expr_rsi(item, ref_ticker, out)
+
+    def _rsi_window_in_expr(self, expr):
+        if not isinstance(expr, list):
+            return None
+        if expr[0] == "fn_relative_strength_index":
+            return expr[2]
+        for item in expr:
+            r = self._rsi_window_in_expr(item)
+            if r is not None:
+                return r
+        return None
+
+    def _ticker_of(self, metric_close_expr, ref_ticker):
+        arg = metric_close_expr[1]
+        if isinstance(arg, list) and arg[0] == "reference":
+            return ref_ticker
+        return arg.split("::")[1].split("//")[0]
+
+    def _representative_ticker(self, node):
+        t = node.get("t")
+        if t == "node_asset":
+            return node["tk"]
+        if t == "node_if" and "cond" in node:
+            tk = self._first_ticker_in_expr(node["cond"])
+            if tk:
+                return tk
+        for key in ("c", "th", "el"):
+            for ch in node.get(key, []):
+                tk = self._representative_ticker(ch)
+                if tk:
+                    return tk
+        return None
+
+    def _first_ticker_in_expr(self, expr):
+        if isinstance(expr, list):
+            for item in expr:
+                if isinstance(item, str) and item.startswith("EQUITIES::"):
+                    return item.split("::")[1].split("//")[0]
+                tk = self._first_ticker_in_expr(item)
+                if tk:
+                    return tk
+        return None
+
+    # ── Metric / condition evaluation ───────────────────────────────
+
+    def _eval_metric(self, expr, ref_ticker=None) -> float:
+        head = expr[0]
+        if head == "fn_constant":
+            return expr[1]
+        if head == "weight_every_fn":
+            return self._eval_metric(expr[1], ref_ticker)
+        if head == "metric_close":
+            tk = self._ticker_of(expr, ref_ticker)
+            w = self._price_window.get(tk)
+            return w[0] if w and w.is_ready else 0.0
+        if head == "fn_relative_strength_index": 
+            tk = self._ticker_of(expr[1], ref_ticker)
+            window = expr[2]
+            ind = self._rsi.get((tk, window))
+            return (ind.current.value / 100.0) if ind and ind.is_ready else 0.5
+        if head == "fn_simple_moving_average":
+            inner, window = expr[1], expr[2]
+            if inner[0] == "metric_close":
+                tk = self._ticker_of(inner, ref_ticker)
+                w = self._price_window.get(tk)
+                if not w or not w.is_ready or w.count < window:
+                    return 0.0
+                return float(np.mean([w[i] for i in range(window)]))
+            elif inner[0] == "fn_rate_of_return":
+                tk = self._ticker_of(inner[1], ref_ticker)
+                w = self._price_window.get(tk)
+                if not w or not w.is_ready or w.count < window + 1:
+                    return 0.0
+                rets = [w[i] / w[i + 1] - 1.0 for i in range(window)]
+                return float(np.mean(rets))
+        if head == "fn_standard_deviation":
+            inner, window = expr[1], expr[2]
+            tk = self._ticker_of(inner[1], ref_ticker)
+            w = self._price_window.get(tk)
+            if not w or not w.is_ready or w.count < window + 1:
+                return 0.0
+            rets = [w[i] / w[i + 1] - 1.0 for i in range(window)]
+            return float(np.std(rets))
+        if head == "fn_cumulative_return":
+            inner, window = expr[1], expr[2]
+            tk = self._ticker_of(inner, ref_ticker)
+            w = self._price_window.get(tk)
+            if not w or not w.is_ready or w.count < window + 1:
+                return 0.0
+            return w[0] / w[window] - 1.0
+        if head == "fn_rate_of_return":
+            tk = self._ticker_of(expr[1], ref_ticker)
+            w = self._price_window.get(tk)
+            if not w or not w.is_ready or w.count < 2:
+                return 0.0
+            return w[0] / w[1] - 1.0
+        raise ValueError(f"unhandled metric expr head: {head}")
+
+    def _eval_cond(self, expr, ref_ticker=None) -> bool:
+        head = expr[0]
+        if head == "fn_gt":
+            return self._eval_metric(expr[1], ref_ticker) > self._eval_metric(expr[2], ref_ticker)
+        if head == "fn_lt":
+            return self._eval_metric(expr[1], ref_ticker) < self._eval_metric(expr[2], ref_ticker)
+        if head == "fn_or":
+            return self._eval_cond(expr[1], ref_ticker) or self._eval_cond(expr[2], ref_ticker)
+        raise ValueError(f"unhandled condition head: {head}")
+
+    # ── Tree resolution -> target weights ───────────────────────────
+
+    def _resolve(self, node) -> dict:
+        t = node["t"]
+        if t == "node_root":
+            return self._resolve_children(node["c"])
+        if t == "node_weight":
+            return self._resolve_weighted(node["c"], node["w"])
+        if t == "node_if":
+            branch = node["th"] if self._eval_cond(node["cond"]) else node.get("el", [])
+            return self._resolve_children(branch)
+        if t == "node_asset":
+            sym = self._syms.get(node["tk"])
+            return {sym: 1.0} if sym is not None else {}
+        if t == "node_filter":
+            return self._resolve_filter(node)
+        raise ValueError(f"unknown node type: {t}")
+
+    def _resolve_children(self, children) -> dict:
+        if not children:
+            return {}
+        combined = {}
+        share = 1.0 / len(children)
+        for ch in children:
+            for sym, w in self._resolve(ch).items():
+                combined[sym] = combined.get(sym, 0.0) + w * share
+        return combined
+
+    def _resolve_weighted(self, children, weight_spec) -> dict:
+        kind = weight_spec[0]
+        if kind == "weight_equal":
+            return self._resolve_children(children)
+        if kind == "weight_constants":
+            weights = weight_spec[1]
+            combined = {}
+            for ch, wt in zip(children, weights):
+                for sym, w in self._resolve(ch).items():
+                    combined[sym] = combined.get(sym, 0.0) + w * wt
+            return combined
+        raise ValueError(f"unknown weight kind: {kind}")
+
+    def _resolve_filter(self, node) -> dict:
+        sort_fn = node["sf"]
+        n = node["n"]
+        direction = node["dir"]
+        scored = []
+        for ch in node["c"]:
+            ref_ticker = self._representative_ticker(ch)
+            score = self._eval_metric(sort_fn, ref_ticker)
+            scored.append((score, ch))
+        scored.sort(key=lambda x: x[0], reverse=(direction == "desc"))
+        selected = [ch for _, ch in scored[:n]]
+        return self._resolve_children(selected)
+
+    # ── Scheduled events ─────────────────────────────────────────────
+
+    def _update_price_windows(self) -> None:
+        for t, sym in self._syms.items():
+            close = self.securities[sym].close
+            if close > 0:
+                self._price_window[t].add(float(close))
+
+    def _snapshot_day_open(self) -> None:
+        """Record today's open for every subscribed ticker; the intraday SL
+        is measured off this, not average cost."""
+        if not self.ENABLE_INTRADAY_SL:
+            return
+        for sym in self._syms.values():
+            price = self.securities[sym].price
+            if price > 0:
+                self._day_open[sym] = float(price)
+
+    def _check_intraday_sl(self) -> None:
+        if not self.ENABLE_INTRADAY_SL or self.is_warming_up:
+            return
+        if not self.is_market_open(self._syms.get("SPY")):
+            return
+        for h in list(self.portfolio.values()):
+            if not h.invested:
+                continue
+            sym = h.symbol
+            open_px = self._day_open.get(sym)
+            price = self.securities[sym].price
+            if not open_px or open_px <= 0 or price <= 0:
+                continue
+            chg = price / open_px - 1.0
+            if chg <= -self.SL_PCT:
+                self.liquidate(sym, tag=f"intraday SL {chg:.1%} vs open (limit {self.SL_PCT:.0%})")
+                self.log(f"[SL] {self.time} {sym.value} {chg:.1%} vs open -> liquidated intraday")
+
+    def _rebalance(self) -> None:
+        if self.is_warming_up:
+            return
+
+        combined = self._resolve(self.tree)
+        total_w = sum(combined.values())
+        if total_w <= 0:
+            return
+
+        targets = set(combined)
+        for h in list(self.portfolio.values()):
+            if h.invested and h.symbol not in targets:
+                self.market_on_open_order(h.symbol, -h.quantity)
+
+        pv = self.portfolio.total_portfolio_value * self.LEVERAGE * (1.0 - self.CASH_BUFFER_PCT)
+
+        # All orders here are MarketOnOpenOrder -- none settle until tomorrow's
+        # open, so the exits submitted above can't be relied on to have freed
+        # up any margin yet when a buy order below gets validated. Track a
+        # local margin budget (starting from what's actually free right now,
+        # with a safety haircut) and cap/skip buy orders against it instead of
+        # submitting the full computed size and letting the broker reject it.
+        margin_budget = self.portfolio.margin_remaining * 0.9
+        MARGIN_RATE_ESTIMATE = 0.5  # matches this account's observed Reg-T rate
+
+        for sym, wt in combined.items():
+            price = self.securities[sym].price
+            if price <= 0:
+                continue
+            target_qty = int(pv * wt / price)
+            delta = target_qty - int(self.portfolio[sym].quantity)
+            if delta == 0:
+                continue
+            if delta > 0:
+                est_margin_needed = delta * price * MARGIN_RATE_ESTIMATE
+                if est_margin_needed > margin_budget:
+                    affordable_qty = int(margin_budget / (price * MARGIN_RATE_ESTIMATE))
+                    if affordable_qty <= 0:
+                        self.log(f"[MARGIN-SKIP] {self.time.date()} {sym.value} skipped, no margin budget left")
+                        continue
+                    self.log(f"[MARGIN-CAP] {self.time.date()} {sym.value} capped {delta} -> {affordable_qty} shares (insufficient margin)")
+                    delta = affordable_qty
+                    est_margin_needed = delta * price * MARGIN_RATE_ESTIMATE
+                margin_budget -= est_margin_needed
+            self.market_on_open_order(sym, delta)
+
+        self._trade_count += 1
+        net = "+".join(f"{round(w*100):.0f}%{s.value}"
+                        for s, w in sorted(combined.items(), key=lambda x: -x[1]) if w > 0.005)
+        self.log(f"[{self._trade_count:04d}] {self.time.date()} | net={net}")
+
+    def on_end_of_algorithm(self) -> None:
+        self.log(f"\n  Final NAV: ${self.portfolio.total_portfolio_value:>15,.2f}  |  Rebalances: {self._trade_count}")
