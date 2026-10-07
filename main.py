@@ -1,4 +1,3 @@
-main.py
 # =============================================================================
 #  WARNING: RISK ONLY CASINO MONEY WITH THIS STRATEGY
 #  PLEASE WAIT FOR MINIMUM 3 MONTHS OF OOS PERFORMANCE
