@@ -1,4 +1,3 @@
-tree_data.py
 # region imports
 from AlgorithmImports import *
 # endregion
